@@ -11,6 +11,7 @@ import (
 	"github.com/chrisvdg/redcon"
 	"github.com/stretchr/testify/assert"
 	"github.com/zero-os/zedis/config"
+	"github.com/zero-os/zedis/server/jwt"
 )
 
 func init() {
@@ -18,8 +19,11 @@ func init() {
 	connsJWTLock = &sync.Mutex{}
 	zConfig = new(config.Zedis)
 	zConfig.AuthCommands = make(map[string]struct{})
-	zConfig.AuthCommands["SET"] = struct{}{}
 
+	// manually set each command to require authentication
+	zConfig.AuthCommands["SET"] = struct{}{}
+	zConfig.AuthCommands["GET"] = struct{}{}
+	zConfig.AuthCommands["EXISTS"] = struct{}{}
 }
 
 func TestPing(t *testing.T) {
@@ -74,7 +78,7 @@ func TestAuth(t *testing.T) {
 }
 
 func TestSet(t *testing.T) {
-	stillValidWithScopes = stubStillValidWithScopes
+	permissionValidator = stubAuthValidator
 	stubStorClient := newStubStorClient()
 	storClient = stubStorClient
 	conn := new(stubConn)
@@ -88,33 +92,23 @@ func TestSet(t *testing.T) {
 	}
 
 	set(conn, cmd)
-	assert.Equal(t, "ERR no authentication token found for this connection", conn.s)
+	assert.Equal(t, unAuthMsg, conn.s)
 
 	// valid args and jwt present
 	connsJWT[conn] = "aJWT"
-	cmd.Args = [][]byte{
-		[]byte("SET"),
-		[]byte("key"),
-		[]byte("value"),
-	}
 
 	set(conn, cmd)
 	assert.Equal(t, "OK", conn.s)
 	assert.Equal(t, []byte("value"), stubStorClient.stor["key"])
 
 	// invalid jwt
-	stillValidWithScopes = stubStillValidWithScopesErr
-	cmd.Args = [][]byte{
-		[]byte("SET"),
-		[]byte("key"),
-		[]byte("value"),
-	}
+	permissionValidator = stubAuthValidatorErr
 
 	set(conn, cmd)
 	assert.Equal(t, "ERR JWT invalid: a stub error", conn.s)
 
 	// invalid command length
-	permissionValidator = stubAuthValidatorErr
+	permissionValidator = stubAuthValidator
 	cmd.Args = [][]byte{
 		[]byte("SET"),
 		[]byte("key"),
@@ -125,21 +119,34 @@ func TestSet(t *testing.T) {
 }
 
 func TestGet(t *testing.T) {
+	permissionValidator = stubAuthValidator
 	storClient = newStubStorClient()
 	storClient.Write([]byte("hello"), []byte("world"))
 	conn := new(stubConn)
 	var cmd redcon.Command
 
-	// valid command args
+	// valid command args, missing JWT
 	cmd.Args = [][]byte{
 		[]byte("GET"),
 		[]byte("hello"),
 	}
 
 	get(conn, cmd)
+	assert.Equal(t, unAuthMsg, conn.s)
+
+	// valid args, valid JWT
+	connsJWT[conn] = "aJWT"
+	get(conn, cmd)
 	assert.Equal(t, "world", conn.s)
 
+	// invalid jwt
+	permissionValidator = stubAuthValidatorErr
+
+	get(conn, cmd)
+	assert.Equal(t, "ERR JWT invalid: a stub error", conn.s)
+
 	// invalid command length
+	permissionValidator = stubAuthValidator
 	cmd.Args = [][]byte{
 		[]byte("GET"),
 		[]byte("hello"),
@@ -150,6 +157,78 @@ func TestGet(t *testing.T) {
 	assert.Equal(t, "ERR wrong number of arguments for 'GET' command", conn.s)
 }
 
+func TestExists(t *testing.T) {
+	permissionValidator = stubAuthValidator
+	storClient = newStubStorClient()
+	storClient.Write([]byte("hello"), []byte("world"))
+	storClient.Write([]byte("lorem"), []byte("ipsum"))
+	storClient.Write([]byte("foo"), []byte("bar"))
+	conn := new(stubConn)
+	var cmd redcon.Command
+
+	// valid command args, missing JWT
+	cmd.Args = [][]byte{
+		[]byte("EXISTS"),
+		[]byte("hello"),
+	}
+
+	exists(conn, cmd)
+	assert.Equal(t, unAuthMsg, conn.s)
+
+	// invalid jwt
+	connsJWT[conn] = "aJWT"
+	permissionValidator = stubAuthValidatorErr
+
+	exists(conn, cmd)
+	assert.Equal(t, "ERR JWT invalid: a stub error", conn.s)
+
+	// invalid command length
+	permissionValidator = stubAuthValidator
+	cmd.Args = [][]byte{
+		[]byte("EXISTS"),
+	}
+
+	exists(conn, cmd)
+	assert.Equal(t, "ERR wrong number of arguments for 'EXISTS' command", conn.s)
+
+	// valid args, valid JWT
+	cmd.Args = [][]byte{
+		[]byte("EXISTS"),
+		[]byte("hello"),
+	}
+	exists(conn, cmd)
+	assert.Equal(t, "1", conn.s)
+
+	// check 2 present keys
+	// valid args, valid JWT
+	cmd.Args = [][]byte{
+		[]byte("EXISTS"),
+		[]byte("hello"),
+		[]byte("lorem"),
+	}
+	exists(conn, cmd)
+	assert.Equal(t, "2", conn.s)
+
+	// check 3 present keys
+	cmd.Args = [][]byte{
+		[]byte("EXISTS"),
+		[]byte("hello"),
+		[]byte("lorem"),
+		[]byte("foo"),
+	}
+	exists(conn, cmd)
+	assert.Equal(t, "3", conn.s)
+
+	// check 2 presents keys and 1 non present
+	cmd.Args = [][]byte{
+		[]byte("EXISTS"),
+		[]byte("hello"),
+		[]byte("lorem"),
+		[]byte("not_a_key"),
+	}
+	exists(conn, cmd)
+	assert.Equal(t, "2", conn.s)
+}
 func TestUnknown(t *testing.T) {
 	var cmd redcon.Command
 	cmd.Args = [][]byte{
@@ -219,23 +298,17 @@ func (c *stubStorClient) Write(key []byte, value []byte) error {
 	c.stor[string(key)] = value
 	return nil
 }
+func (c *stubStorClient) KeyExists(key []byte) (bool, error) {
+	_, ok := c.stor[string(key)]
+	return ok, nil
+}
 
 // stub validator that returns nil (success)
-func stubAuthValidator(jwtStr, organization, namespace string) error {
+func stubAuthValidator(jwtStr, organization, namespace string, getExpectedScopes jwt.GetScopes) error {
 	return nil
 }
 
 // stub validator that returns "a stub error" error
-func stubAuthValidatorErr(jwtStr, organization, namespace string) error {
-	return errors.New("a stub error")
-}
-
-// stub still valid validator that returns nil
-func stubStillValidWithScopes(jwtStr string, scopes []string) error {
-	return nil
-}
-
-// stub still valid validator that returns an error
-func stubStillValidWithScopesErr(jwtStr string, scopes []string) error {
+func stubAuthValidatorErr(jwtStr, organization, namespace string, getExpectedScopes jwt.GetScopes) error {
 	return errors.New("a stub error")
 }
