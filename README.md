@@ -18,6 +18,9 @@ Zedis is a [Redis protocol][redisProtocol] interface for the [0-stor][zeroStor]
 * `GET`: Get a value from a key
     * expects: key
     * reply: key value
+* `EXISTS`: Checks if keys exists 
+    * expects: space separated list of keys
+    * reply: int that represents how many of the keys were found
 
 ## Security
 
@@ -49,7 +52,7 @@ e.g. :
 To set which commands require authentication, define them as a comma separated list in the `auth_commands` field in the config file.  
 By default, the `SET` command requires authentication.  
 If `auth_commands` is set to `none`, none of the commands require authentication.  
-If set to `all`, all commands other then `AUTH`, `PING` and `QUIT` require authentication.
+If set to `all`, all commands other than `AUTH`, `PING` and `QUIT` require authentication.
 
 ## Configuration file
 

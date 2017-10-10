@@ -12,18 +12,18 @@ var (
 )
 
 func ping(conn redcon.Conn) {
-	log.Debugf("received PING request from %s", conn.RemoteAddr())
+	log.Debugf("received PING command from %s", conn.RemoteAddr())
 	conn.WriteString("PONG")
 }
 
 func quit(conn redcon.Conn) {
-	log.Debugf("received QUIT request from %s", conn.RemoteAddr())
+	log.Debugf("received QUIT command from %s", conn.RemoteAddr())
 	conn.WriteString("OK")
 	conn.Close()
 }
 
 func auth(conn redcon.Conn, cmd redcon.Command) {
-	log.Debugf("received AUTH request from %s", conn.RemoteAddr())
+	log.Debugf("received AUTH command from %s", conn.RemoteAddr())
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
@@ -45,13 +45,13 @@ func auth(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func set(conn redcon.Conn, cmd redcon.Command) {
-	log.Debugf("received SET request from %s", conn.RemoteAddr())
+	log.Debugf("received SET command from %s", conn.RemoteAddr())
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
 
-	// check authentication
+	// check if command needs authentication
 	_, authorize := zConfig.AuthCommands[string(cmd.Args[0])]
 	if authorize {
 		connsJWTLock.Lock()
@@ -73,13 +73,13 @@ func set(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func get(conn redcon.Conn, cmd redcon.Command) {
-	log.Debugf("received GET request from %s", conn.RemoteAddr())
+	log.Debugf("received GET command from %s", conn.RemoteAddr())
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
 
-	// check authentication
+	// check if command needs authentication
 	_, authorize := zConfig.AuthCommands[string(cmd.Args[0])]
 	if authorize {
 		connsJWTLock.Lock()
@@ -107,13 +107,13 @@ func get(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func exists(conn redcon.Conn, cmd redcon.Command) {
-	log.Debugf("received EXISTS request from %s", conn.RemoteAddr())
+	log.Debugf("received EXISTS command from %s", conn.RemoteAddr())
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
 
-	// check authentication
+	// check if command needs authentication
 	_, authorize := zConfig.AuthCommands[string(cmd.Args[0])]
 	if authorize {
 		connsJWTLock.Lock()
