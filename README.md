@@ -72,34 +72,25 @@ acme_whitelist:     #hostnames let's encrypt is allowed to sign, if empty it wil
                     # https://godoc.org/golang.org/x/crypto/acme/autocert#HostWhitelist
 
 # configuration for the 0-stor client
-
-organization: zedis_0stor_org       #itsyou.online organization the 0-stor for Zedis belongs to
-namespace: zedis_0stor_namespace    #itsyou.online namespace the 0-stor for Zedis belongs to
-iyo_app_id: <replace with an itsyou.online app id>  #itsyou.online app id of the Zedis app
-iyo_app_secret: <replace with an itsyou.online app secret>  #itsyou.online app secret of the Zedis app
-# the address(es) of 0-stor cluster
-data_shards:
-    - 127.0.0.1:12345
-    - 127.0.0.1:12346
-    - 127.0.0.1:12347
-    - 127.0.0.1:12348
-# the address(es) of etcd server(s) for the metadata
-meta_shards:
-    - http://127.0.0.1:2379
-    - http://127.0.0.1:22379
-    - http://127.0.0.1:32379
-
-block_size: 4096
-
-replication_nr: 4
-replication_max_size: 4096
-
-distribution_data: 3
-distribution_parity: 1
-
-compress: true
-encrypt: true
-encrypt_key: ab345678901234567890123456789012
+zstor_config:
+    namespace: thedisk
+    datastor:
+        shards:
+            - 127.0.0.1:12345
+            - 127.0.0.1:12346
+            - 127.0.0.1:12347
+    metastor:
+        shards:
+            - 127.0.0.1:2379
+    pipeline:
+        block_size: 4096
+        compression:
+            mode: default
+        encryption:
+            private_key: ab345678901234567890123456789012
+        distribution:
+            data_shards: 2
+            parity_shards: 1
 ```
 
 More information about the 0-stor configuration can be found in the [0-stor client config documentation][0storclient]

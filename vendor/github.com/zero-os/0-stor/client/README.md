@@ -13,6 +13,7 @@ API documentation : [https://godoc.org/github.com/zero-os/0-stor/client](https:/
 - Building a **secure** & **fast** object store with support for big files
 
 ## Basic idea
+
 - Splitting a large file into smaller chunks.
 - Compress each chunk using [snappy](https://github.com/google/snappy)
 - Encrypt each chunk using Hash(content)
@@ -26,13 +27,25 @@ API documentation : [https://godoc.org/github.com/zero-os/0-stor/client](https:/
     - Assemble file from chunks
 
 ## Important
-- 0stor server is JUST a simple key/value store
-- splitting, compression, encryption, and replication is the responsibility of client
 
+- 0-stor server is JUST a simple key/value store
+- splitting, compression, encryption, and replication is the responsibility of client
+- you need at least etcd v3
 
 **Features**
 
 - [Erasure coding](http://smahesh.com/blog/2012/07/01/dummies-guide-to-erasure-coding/)
+
+**Reference list**
+
+The `client.Write` method takes a third parameter other then the key and value, namely the reference list (`refList`).  
+This reference list is also returned as the second value from the `client.Read` method.
+
+This reference list is attached to each object and is fully managed by the client.  
+As the 0-stor server doesn't do anything with this list, it can be omitted and ignored if the client has no desire of using it.  
+The reference list for example, can be used to allow the client to do deduplication.
+
+***TODO: show example (https://github.com/zero-os/0-stor/issues/216)***
 
 ## Metadata
 
@@ -47,23 +60,21 @@ API documentation : [https://godoc.org/github.com/zero-os/0-stor/client](https:/
 	type Meta struct {
 		Epoch     int64  # creation epoch
 		Key       []byte # key used in the 0-stor
-		EncrKey   []byte # Encryption key used to encrypt this file
 		Chunks    []*Chunk # list of chunks of the files
 		Previous  []byte   # Key to the previous metadata entry
 		Next      []byte   # Key to the next metadata entry
 		ConfigPtr []byte   # Key to the configuration used by the lib to set the data.
 	}
     ```
+
 **chunks**
 
-Depending on the policy used to create the client, the data can be splitted into multiple chunks or not.  Which mean the metadata can be composed of minimum one up to n chunks.
+Depending on the policy used to create the client, the data could be split into multiple chunks.  Which means that the metadata can be composed of minimum one up to n chunks.
 
 Each chunks can then have one or multiple shards.
 
 - If you use replication, each shards is the location of one of the replicate.
 - If you use distribution, each shards is the location of one of the data or parity block.
-
-
 
 **metadata linked list**
 
@@ -75,8 +86,8 @@ Metadata linked list will be build if  user specify previous meta key when
 calling `WriteWithMeta` or `WriteFWithMeta` methods.
 
 ## Getting started
-- [Getting started](./cmd/zerostorcli/README.md)
 
+- [Getting started](../cmd/zstor/README.md)
 
 ## Now into some technical details!
 
@@ -85,12 +96,12 @@ calling `WriteWithMeta` or `WriteFWithMeta` methods.
 - Client does some preprocessing on each chunk of data before sending them to 0stor
 - This is achieved by configuring a policy during client creation
 - Supported Data Preprocessing:
-    - [chunker](./lib/chunker)
-	- [compression](./lib/compress/README.md)
-    - [Hasher](./lib/hash/README.md)
-    - [encryption](./lib/encrypt/README.md)
-    - [distribution / erasure coding](./lib/distribution/README.md)
-    - [replication](./lib/replication/README.md)
+    - [chunker](./components/chunker)
+	- [compression](./components/compress/README.md)
+    - [Hasher](./components/hash/README.md)
+    - [encryption](./components/encrypt/README.md)
+    - [distribution / erasure coding](./components/distribution/README.md)
+    - [replication](./components/replication/README.md)
 
 **walk over the metadata**
 
@@ -109,134 +120,58 @@ It can be used for example to reconstruct the stored sequential data.
 
 ## Using 0-stor client examples:
 
+### Hello World
 
-In below example, when we store the data, the data will be processed as follow:
+File: [/examples/hello_world/main.go](/examples/hello_world/main.go)
+
+In this example, when we store the data, the data will be processed as follow:
 plain data -> compress -> encrypt -> distribution/erasure encoding (which send to 0-stor server and write metadata)
 
 When we get the data from 0-stor, the reverse process will happen:
-distribution/erasure decoding (which read metdata & Get data from 0-stor) -> decrypt -> decompress -> plain data.
+distribution/erasure decoding (which reads metadata & Get data from 0-stor) -> decrypt -> decompress -> plain data.
 
 To run this example, you need to run:
-- 0-stor server at port 12345
-- 0-stor server at port 12346
-- 0-stor server at port 12347
+- 0-stor no-auth server at port 12345
+- 0-stor no-auth server at port 12346
+- 0-stor no-auth server at port 12347
 - etcd server at port 2379
 
-```go
-package main
-
-import (
-	"log"
-
-	"github.com/zero-os/0-stor/client"
-)
-
-func main() {
-
-	policy := client.Policy{
-		Organization:           "labhijau",
-		Namespace:              "thedisk",
-		DataShards:             []string{"http://127.0.0.1:12345", "http://127.0.0.1:12346", "http://127.0.0.1:12347"},
-		MetaShards:             []string{"http://127.0.0.1:2379"},
-		IYOAppID:               "the_id",
-		IYOSecret:              "the_secret",
-		Compress:               true,
-		Encrypt:                true,
-		EncryptKey:             "ab345678901234567890123456789012",
-		BlockSize:              4096,
-		ReplicationNr:          0, // force to use distribution
-		ReplicationMaxSize:     0, // force to use distribution
-		DistributionNr:         2,
-		DistributionRedundancy: 1,
-	}
-	c, err := client.New(policy)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	data := []byte("hello 0-stor")
-	key := []byte("hi guys")
-
-	// stor to 0-stor
-	_, err = c.Write(key, data)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// read the data
-	stored, err := c.Read(key)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("stored data=%v\n", string(stored))
-}
-```
-
-### Example using configuration file
-
-```go
-package main
-
-import (
-	"log"
-	"os"
-
-	"github.com/zero-os/0-stor/client"
-)
-
-func main() {
-	f, err := os.Open("./config.yaml")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-
-	policy, err := client.NewPolicyFromReader(f)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	client, err := client.New(policy)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	data := []byte("hello 0-stor")
-	key := []byte("hello")
-	refList := []string("ref-1")
-
-	// stor to 0-stor
-	_, err = client.Write(key, data, refList)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// read data
-	stored, storedRefList, err := client.Read(key)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("stored value=%v\n", string(stored))
-
-}
-
+Than you can run the example as follows:
 
 ```
+go run examples/hello_world/main.go
+```
 
+Please check out the source code to see how this example works.
+
+### Hello World: Config File Edition
+
+File: [/examples/hello_config/main.go](/examples/hello_config/main.go)
+
+In this file we are doing exactly the same,
+and you'll need to run the same servers as were required before.
+
+However this time we create the client, using a file-based config.
+
+You can run the example as follows:
+
+```
+go run examples/hello_config/main.go
+```
+
+Please check out the source code to see how this example works.
 
 ## Configuration
 
-Configuration file example can be found on [config.yaml](./cmd/cli/config.yaml).
+Configuration file example can be found on [config.yaml](/cmd/zstor/config.yaml).
 
 ## Libraries
 
-This client some libraries that can be used independently.
-See [lib](./lib) directory for more details.
+This client includes some components that can be used independently.
+See [components](./components) directory for more details.
 
 ## CLI
 
-A simple cli can be found on [cli](./cmd/zerostorcli) directory.
+A cli can be found in the [cli](./cmd/zstor) directory.
 
-## Daemon
-
-There will be client daemon on [daemon](./cmd/daemon) directory.
+This command-line client includes a command to spawn it as a daemon.

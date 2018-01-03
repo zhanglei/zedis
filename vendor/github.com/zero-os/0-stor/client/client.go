@@ -1,758 +1,344 @@
+/*
+ * Copyright (C) 2017-2018 GIG Technology NV and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package client
 
 import (
-	"bytes"
 	"errors"
-	"fmt"
 	"io"
-	"io/ioutil"
-	"math/rand"
-	"sync"
+	"time"
 
-	"github.com/zero-os/0-stor/client/lib"
-
+	"github.com/zero-os/0-stor/client/datastor"
+	storgrpc "github.com/zero-os/0-stor/client/datastor/grpc"
 	"github.com/zero-os/0-stor/client/itsyouonline"
-	"github.com/zero-os/0-stor/client/lib/chunker"
-	"github.com/zero-os/0-stor/client/lib/distribution"
-	"github.com/zero-os/0-stor/client/lib/encrypt"
-	"github.com/zero-os/0-stor/client/meta"
-	"github.com/zero-os/0-stor/client/stor"
-	pb "github.com/zero-os/0-stor/grpc_store"
-
-	log "github.com/Sirupsen/logrus"
-	"github.com/golang/snappy"
-	"github.com/minio/blake2b-simd"
+	"github.com/zero-os/0-stor/client/metastor"
+	"github.com/zero-os/0-stor/client/metastor/etcd"
+	"github.com/zero-os/0-stor/client/pipeline"
+	"github.com/zero-os/0-stor/client/pipeline/storage"
 )
 
 var (
-	errWriteFChunkerOnly    = errors.New("WriteF only support chunker as first pipe")
-	errReadFChunkerOnly     = errors.New("ReadF only support chunker as first pipe")
-	errNoDataShardAvailable = errors.New("no more data shard available")
-)
+	// ErrNilKey is an error returned in case a nil key is given to a client method.
+	ErrNilKey = errors.New("Client: nil/empty key given")
+	// ErrNilContext is an error returned in case a context given to a client method is nil.
+	ErrNilContext = errors.New("Client: nil context given")
 
-var _ (itsyouonline.IYOClient) = (*Client)(nil) // build time check that we implement itsyouonline.IYOClient interface
+	// ErrRepairSupport is returned when data is not stored using replication or distribution
+	ErrRepairSupport = errors.New("data is not stored using replication or distribution, repair impossible")
+)
 
 // Client defines 0-stor client
 type Client struct {
-	policy   Policy
-	iyoToken string
-
-	storClients   map[string]stor.Client
-	muStorClients sync.Mutex
-
-	metaCli *meta.Client
-	iyoCl   itsyouonline.IYOClient
+	dataPipeline   pipeline.Pipeline
+	metastorClient metastor.Client
 }
 
-// New creates new client from the given config
-func New(policy Policy) (*Client, error) {
-	var iyoCl itsyouonline.IYOClient
-	if policy.Organization != "" && policy.IYOAppID != "" && policy.IYOSecret != "" {
-		iyoCl = itsyouonline.NewClient(policy.Organization, policy.IYOAppID, policy.IYOSecret)
+// NewClientFromConfig creates new 0-stor client using the given config,
+// with (JWT Token) caching enabled only if required.
+//
+// JWT Token caching is required only if IYO credentials have been configured
+// in the given config, which are to be used to create tokens using the IYO Web API.
+//
+// If JobCount is 0 or negative, the default JobCount will be used,
+// as defined by the pipeline package.
+func NewClientFromConfig(cfg Config, jobCount int) (*Client, error) {
+	return newClientFromConfig(&cfg, jobCount, true)
+}
+
+// NewClientFromConfigWithoutCaching creates new 0-stor client using the given config,
+// and with (JWT Token) caching disabled.
+//
+// If JobCount is 0 or negative, the default JobCount will be used,
+// as defined by the pipeline package.
+func NewClientFromConfigWithoutCaching(cfg Config, jobCount int) (*Client, error) {
+	return newClientFromConfig(&cfg, jobCount, false)
+}
+
+func newClientFromConfig(cfg *Config, jobCount int, enableCaching bool) (*Client, error) {
+	// create datastor cluster
+	datastorCluster, err := createDataClusterFromConfig(cfg, enableCaching)
+	if err != nil {
+		return nil, err
 	}
 
-	return newClient(policy, iyoCl)
+	// create data pipeline, using our datastor cluster
+	dataPipeline, err := pipeline.NewPipeline(cfg.Pipeline, datastorCluster, jobCount)
+	if err != nil {
+		return nil, err
+	}
+
+	// if no metadata shards are given, return an error,
+	// as we require a metastor client
+	// TODO: allow a more flexible kind of metastor client configuration,
+	// so we can also allow other types of metastor clients,
+	// as we do really need one.
+	if len(cfg.MetaStor.Shards) == 0 {
+		return nil, errors.New("no metadata storage given")
+	}
+
+	// create metastor client first,
+	// and than create our master 0-stor client with all features.
+	metastorClient, err := etcd.NewClient(cfg.MetaStor.Shards, nil)
+	if err != nil {
+		return nil, err
+	}
+	return NewClient(metastorClient, dataPipeline), nil
 }
 
-func newClient(policy Policy, iyoCl itsyouonline.IYOClient) (*Client, error) {
+func createDataClusterFromConfig(cfg *Config, enableCaching bool) (datastor.Cluster, error) {
+	if cfg.IYO == (itsyouonline.Config{}) {
+		// create datastor cluster without the use of IYO-backed JWT Tokens,
+		// this will only work if all shards use zstordb servers that
+		// do not require any authentication
+		return storgrpc.NewCluster(cfg.DataStor.Shards, cfg.Namespace, nil)
+	}
+
+	// create IYO client
+	client, err := itsyouonline.NewClient(cfg.IYO)
+	if err != nil {
+		return nil, err
+	}
+
+	var tokenGetter datastor.JWTTokenGetter
+	// create JWT Token Getter (Using the earlier created IYO Client)
+	tokenGetter, err = datastor.JWTTokenGetterUsingIYOClient(cfg.IYO.Organization, client)
+	if err != nil {
+		return nil, err
+	}
+
+	if enableCaching {
+		// create cached token getter from this getter, using the default bucket size and count
+		tokenGetter, err = datastor.CachedJWTTokenGetter(tokenGetter, -1, -1)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// create datastor cluster, with the use of IYO-backed JWT Tokens
+	return storgrpc.NewCluster(cfg.DataStor.Shards, cfg.Namespace, tokenGetter)
+}
+
+// NewClient creates a 0-stor client,
+// with the data (zstordb) cluster already created,
+// used to read/write object data, as well as the metastor client,
+// which is used to read/write the metadata of the objects.
+func NewClient(metaClient metastor.Client, dataPipeline pipeline.Pipeline) *Client {
+	if metaClient == nil {
+		panic("0-stor Client: no metastor client given")
+	}
+	if dataPipeline == nil {
+		panic("0-stor Client: no data pipeline given")
+	}
+	return &Client{
+		dataPipeline:   dataPipeline,
+		metastorClient: metaClient,
+	}
+}
+
+// Write writes the data to a 0-stor cluster,
+// storing the metadata using the internal metastor client.
+func (c *Client) Write(key []byte, r io.Reader) (*metastor.Metadata, error) {
+	if len(key) == 0 {
+		return nil, ErrNilKey // ensure a key is given
+	}
+
+	// process and write the data
+	chunks, err := c.dataPipeline.Write(r)
+	if err != nil {
+		return nil, err
+	}
+
+	// create new metadata, as we'll overwrite either way
+	now := EpochNow()
+	md := metastor.Metadata{
+		Key:            key,
+		CreationEpoch:  now,
+		LastWriteEpoch: now,
+	}
+
+	// set/update chunks and size in metadata
+	md.Chunks = chunks
+	for _, chunk := range chunks {
+		md.Size += chunk.Size
+	}
+
+	// store metadata
+	err = c.metastorClient.SetMetadata(md)
+	return &md, err
+}
+
+// Read reads the data, from the 0-stor cluster,
+// using the reference information fetched from the storage-retrieved metadata
+// (which is linked to the given key).
+func (c *Client) Read(key []byte, w io.Writer) error {
+	if len(key) == 0 {
+		return ErrNilKey // ensure a key is given
+	}
+	meta, err := c.metastorClient.GetMetadata(key)
+	if err != nil {
+		return err
+	}
+	return c.dataPipeline.Read(meta.Chunks, w)
+}
+
+// ReadWithMeta reads the data, from the 0-stor cluster,
+// using the reference information fetched from the given metadata.
+func (c *Client) ReadWithMeta(meta metastor.Metadata, w io.Writer) error {
+	return c.dataPipeline.Read(meta.Chunks, w)
+}
+
+// Delete deletes the data, from the 0-stor cluster,
+// using the reference information fetched from the metadata (which is linked to the given key).
+func (c *Client) Delete(key []byte) error {
+	if len(key) == 0 {
+		return ErrNilKey // ensure a key is given
+	}
+	meta, err := c.metastorClient.GetMetadata(key)
+	if err != nil {
+		return err
+	}
+	return c.DeleteWithMeta(*meta)
+}
+
+// DeleteWithMeta deletes the data, from the 0-stor cluster,
+// using the reference information fetched from the given metadata
+// (which is linked to the given key).
+func (c *Client) DeleteWithMeta(meta metastor.Metadata) error {
+	// delete data
+	err := c.dataPipeline.Delete(meta.Chunks)
+	if err != nil {
+		return err
+	}
+	// delete metadata
+	return c.metastorClient.DeleteMetadata(meta.Key)
+}
+
+// Check gets the status of data stored in a 0-stor cluster.
+// It does so using the chunks stored as metadata, after fetching those, using the metastor client.
+// If the metadata cannot be fetched or the status of a/the data chunk(s) cannot be retrieved,
+// an error will be returned. Otherwise CheckStatusInvalid indicates the data is invalid and non-repairable,
+// Any other value indicates the data is readable, but if it's not optimal, it could use a repair.
+func (c *Client) Check(key []byte, fast bool) (storage.CheckStatus, error) {
+	if len(key) == 0 {
+		return storage.CheckStatus(0), ErrNilKey // ensure a key is given
+	}
+	meta, err := c.metastorClient.GetMetadata(key)
+	if err != nil {
+		return storage.CheckStatus(0), err
+	}
+	return c.dataPipeline.Check(meta.Chunks, fast)
+}
+
+// CheckWithMeta gets the status of data stored in a 0-stor cluster.
+// It does so using the chunks stored as metadata, after fetching those, using the metastor client.
+// If the metadata cannot be fetched or the status of a/the data chunk(s) cannot be retrieved,
+// an error will be returned. Otherwise CheckStatusInvalid indicates the data is invalid and non-repairable,
+// Any other value indicates the data is readable, but if it's not optimal, it could use a repair.
+func (c *Client) CheckWithMeta(meta metastor.Metadata, fast bool) (storage.CheckStatus, error) {
+	return c.dataPipeline.Check(meta.Chunks, fast)
+}
+
+// Repair repairs broken data, whether it's needed or not.
+//
+// If the data is distributed and the amount of corrupted chunks is acceptable,
+// we recreate the missing chunks.
+//
+// Id the data is replicated and we still have one valid replication, we create the missing replications
+// until we reach the replication number configured in the config.
+//
+// if the data has not been distributed or replicated, we can't repair it,
+// or if not enough shards are available we cannot repair it either.
+func (c *Client) Repair(key []byte) (*metastor.Metadata, error) {
+	if len(key) == 0 {
+		return nil, ErrNilKey // ensure a key is given
+	}
+
+	// because of conflicts, the callback might be called multiple times,
+	// hence why we want to only do the actual repairing once
 	var (
-		iyoToken string
-		err      error
+		repairedChunks       []metastor.Chunk
+		totalSizeAfterRepair int64
+		repairEpoch          int64
 	)
+	return c.metastorClient.UpdateMetadata(key,
+		func(meta metastor.Metadata) (*metastor.Metadata, error) {
+			// repair if not yet repaired
+			if repairEpoch == 0 {
+				var err error
+				// repair the chunks (if possible)
+				repairedChunks, err = c.dataPipeline.Repair(meta.Chunks)
+				if err != nil {
+					if err == storage.ErrNotSupported {
+						return nil, ErrRepairSupport
+					}
+					return nil, err
+				}
+				// create the last-write epoch here,
+				// such that this time is correct,
+				// even when we have to retry multiple times, due to conflicts
+				repairEpoch = EpochNow()
+				// do the size computation here,
+				// such that we only have to compute it once
+				for _, chunk := range repairedChunks {
+					totalSizeAfterRepair += chunk.Size
+				}
+			}
 
-	if iyoCl != nil {
-		iyoToken, err = iyoCl.CreateJWT(policy.Namespace, itsyouonline.Permission{
-			Write: true,
-			Read:  true,
+			// update chunks
+			meta.Chunks = repairedChunks
+			// update total size
+			meta.Size = totalSizeAfterRepair
+			// update last write epoch, as we have written while repairing
+			meta.LastWriteEpoch = repairEpoch
+
+			// return the updated metadata
+			return &meta, nil
 		})
-		if err != nil {
-			log.Error(err.Error())
-			return nil, err
-		}
-	}
-
-	client := Client{
-		policy:      policy,
-		iyoToken:    iyoToken,
-		iyoCl:       iyoCl,
-		storClients: make(map[string]stor.Client, len(policy.DataShards)),
-	}
-
-	// instanciate stor client for each shards.
-	for _, shard := range policy.DataShards {
-		// getStor keep the created stor in a map
-		_, err := client.getStor(shard)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// instanciate meta client
-	if len(policy.MetaShards) > 0 {
-		// meta client
-		metaCli, err := meta.NewClient(policy.MetaShards)
-		if err != nil {
-			return nil, err
-		}
-		client.metaCli = metaCli
-	}
-
-	return &client, nil
 }
 
-// Close the client
+// Close the client and all its used (internal/indirect) resources.
 func (c *Client) Close() error {
-	if c.metaCli != nil {
-		c.metaCli.Close()
+	var ce closeErrors
+	err := c.metastorClient.Close()
+	if err != nil {
+		ce = append(ce, err)
 	}
-
-	for shard, cl := range c.storClients {
-		closer, ok := cl.(io.Closer)
-		if ok {
-			if err := closer.Close(); err != nil {
-				log.Errorf("Error closing stor client to %v", shard)
-			}
-		}
+	err = c.dataPipeline.Close()
+	if err != nil {
+		ce = append(ce, err)
+	}
+	if len(ce) > 0 {
+		return ce
 	}
 	return nil
 }
 
-// Write write the value to the the 0-stors configured by the client policy
-func (c *Client) Write(key, value []byte, refList []string) (*meta.Meta, error) {
-	return c.WriteWithMeta(key, value, nil, nil, nil, refList)
+// EpochNow returns the current time,
+// expressed in nano seconds, within the UTC timezone, in the epoch (unix) format.
+func EpochNow() int64 {
+	return time.Now().UTC().UnixNano()
 }
 
-func (c *Client) WriteF(key []byte, r io.Reader, refList []string) (*meta.Meta, error) {
-	return c.writeFWithMeta(key, r, nil, nil, nil, refList)
-}
+type closeErrors []error
 
-// WriteWithMeta writes the key-value to the configured pipes.
-// Metadata linked list will be build if prevKey is not nil
-// prevMeta is optional previous metadata, to be used in case of user already has the prev meta.
-// So the client won't need to fetch it back from the metadata server.
-// prevKey still need to be set it prevMeta is set
-// initialMeta is optional metadata, if user want to set his own initial metadata for example set own epoch
-func (c *Client) WriteWithMeta(key, val []byte, prevKey []byte, prevMeta, md *meta.Meta, refList []string) (*meta.Meta, error) {
-	r := bytes.NewReader(val)
-	return c.writeFWithMeta(key, r, prevKey, prevMeta, md, refList)
-}
-
-func (c *Client) WriteFWithMeta(key []byte, r io.Reader, prevKey []byte, prevMeta, md *meta.Meta, refList []string) (*meta.Meta, error) {
-	return c.writeFWithMeta(key, r, prevKey, prevMeta, md, refList)
-}
-
-func (c *Client) writeFWithMeta(key []byte, r io.Reader, prevKey []byte, prevMeta, md *meta.Meta, refList []string) (*meta.Meta, error) {
-	var (
-		blockSize int
-		err       error
-		aesgm     encrypt.EncrypterDecrypter
-		blakeH    = blake2b.New256()
-	)
-
-	if c.policy.Encrypt {
-		aesgm, err = encrypt.NewEncrypterDecrypter(encrypt.Config{PrivKey: c.policy.EncryptKey, Type: encrypt.TypeAESGCM})
-		if err != nil {
-			return nil, err
-		}
+// Error implements error.Error
+func (ce closeErrors) Error() string {
+	var str string
+	for _, e := range ce {
+		str += e.Error() + ";"
 	}
-
-	if len(prevKey) > 0 && prevMeta == nil {
-		// get the prev meta now than later
-		// to avoid making processing and then
-		// just found that prev meta is invalid
-		prevMeta, err = c.metaCli.Get(string(prevKey))
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// create new metadata if not given
-	if md == nil {
-		md = meta.New(key)
-	}
-
-	// define the block size to use
-	// if policy block size is set to 0:
-	//		 we read all content of r, get the size of the data
-	// 		 and configuer the chuner with this size, so there is going to be only one chunk
-	// else use the block size from the policy
-	if c.policy.BlockSize <= 0 {
-		b, err := ioutil.ReadAll(r)
-		if err != nil {
-			return nil, err
-		}
-		blockSize = len(b)
-		r = bytes.NewReader(b)
-	} else {
-		blockSize = c.policy.BlockSize
-	}
-
-	rd := chunker.NewReader(r, chunker.Config{ChunkSize: blockSize})
-
-	var usedShards []string
-	for rd.Next() {
-		block := rd.Value()
-
-		blakeH.Reset()
-		blakeH.Write(block)
-		hashed := blakeH.Sum(nil)
-
-		chunkKey := hashed[:]
-		chunk := &meta.Chunk{Key: chunkKey}
-
-		if c.policy.Encrypt {
-			block, err = aesgm.Encrypt(block)
-			md.EncrKey = []byte(c.policy.EncryptKey)
-			chunk.Size = uint64(len(block))
-		}
-
-		if c.policy.Compress {
-			block = snappy.Encode(nil, block)
-			chunk.Size = uint64(len(block))
-		}
-
-		switch {
-		case c.policy.ReplicationEnabled(len(block)):
-			usedShards, err = c.replicateWrite(chunkKey, block, refList)
-			if err != nil {
-				return nil, err
-			}
-		case c.policy.DistributionEnabled():
-			usedShards, _, err = c.distributeWrite(chunkKey, block, refList)
-			if err != nil {
-				return nil, err
-			}
-		default:
-			shard, err := c.writeRandom(chunkKey, block, refList)
-			if err != nil {
-				return nil, err
-			}
-			usedShards = []string{shard}
-		}
-
-		chunk.Size = uint64(len(block))
-		chunk.Shards = usedShards
-		md.Chunks = append(md.Chunks, chunk)
-	}
-
-	err = c.linkMeta(md, prevMeta, key, prevKey)
-	if err != nil {
-		return md, err
-	}
-
-	return md, nil
-}
-
-// Read reads value with given key from the 0-stors configured by the client policy
-// it will first try to get the metadata associated with key from the Metadata servers.
-// It returns the value and it's reference list
-func (c *Client) Read(key []byte) ([]byte, []string, error) {
-	md, err := c.metaCli.Get(string(key))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	w := &bytes.Buffer{}
-	refList, err := c.readFWithMeta(md, w)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return w.Bytes(), refList, nil
-}
-
-// ReadF similar as Read but write the data to w instead of returning a slice of bytes
-func (c *Client) ReadF(key []byte, w io.Writer) ([]string, error) {
-	md, err := c.metaCli.Get(string(key))
-	if err != nil {
-		return nil, err
-	}
-	return c.readFWithMeta(md, w)
-
-}
-
-// ReadWithMeta reads the value described by md
-func (c *Client) ReadWithMeta(md *meta.Meta) ([]byte, []string, error) {
-	w := &bytes.Buffer{}
-	refList, err := c.readFWithMeta(md, w)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return w.Bytes(), refList, nil
-}
-
-func (c *Client) readFWithMeta(md *meta.Meta, w io.Writer) (refList []string, err error) {
-	var (
-		aesgm encrypt.EncrypterDecrypter
-		block []byte
-		obj   *pb.Object
-	)
-
-	if c.policy.Encrypt {
-		aesgm, err = encrypt.NewEncrypterDecrypter(encrypt.Config{PrivKey: c.policy.EncryptKey, Type: encrypt.TypeAESGCM})
-		if err != nil {
-			return
-		}
-	}
-
-	for _, chunk := range md.Chunks {
-
-		switch {
-		case c.policy.ReplicationEnabled(int(chunk.Size)):
-			obj, err = c.replicateRead(chunk.Key, chunk.Shards)
-			if err != nil {
-				return
-			}
-		case c.policy.DistributionEnabled():
-			obj, err = c.distributeRead(chunk.Key, int(chunk.Size), chunk.Shards)
-			if err != nil {
-				return
-			}
-		default:
-			if len(chunk.Shards) <= 0 {
-				err = fmt.Errorf("metadata corrupted, can't have a chunk without shard")
-				return
-			}
-
-			obj, err = c.read(chunk.Key, chunk.Shards[0])
-			if err != nil {
-				return
-			}
-		}
-		block = obj.Value
-		refList = obj.ReferenceList
-
-		if c.policy.Compress {
-			block, err = snappy.Decode(nil, block)
-			if err != nil {
-				return
-			}
-		}
-
-		if c.policy.Encrypt {
-			block, err = aesgm.Decrypt(block)
-			if err != nil {
-				return
-			}
-		}
-
-		_, err = w.Write(block)
-		if err != nil {
-			return
-		}
-	}
-
-	return
-}
-
-func (c *Client) replicateWrite(key, value []byte, referenceList []string) ([]string, error) {
-
-	if c.policy.ReplicationNr <= 2 {
-		return nil, fmt.Errorf("replication number can't be lower then 2")
-	}
-
-	type Job struct {
-		client stor.Client
-		shard  string
-	}
-
-	var (
-		usedShards = []string{}
-		okShards   = make([]string, 0, c.policy.ReplicationNr)
-		wg         sync.WaitGroup
-		mu         sync.Mutex
-		shardErr   = &lib.ShardError{}
-		cJob       = make(chan *Job)
-	)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		for job := range cJob {
-			wg.Add(1)
-
-			go func(job *Job) {
-				defer wg.Done()
-
-				err := job.client.ObjectCreate(key, value, referenceList)
-				if err != nil {
-					log.Errorf("replication write: error writing to store %s: %v", job.shard, err)
-					shardErr.Add([]string{job.shard}, lib.ShardType0Stor, err, 0)
-					return
-				}
-				mu.Lock()
-				okShards = append(okShards, job.shard)
-				mu.Unlock()
-			}(job)
-		}
-	}()
-
-	for i := 0; i < c.policy.ReplicationNr; i++ {
-		cl, shard, err := c.getRandomStor(usedShards)
-		if err != nil {
-			return nil, err
-		}
-
-		cJob <- &Job{
-			client: cl,
-			shard:  shard,
-		}
-		usedShards = append(usedShards, shard)
-	}
-
-	close(cJob)
-	wg.Wait()
-
-	if len(okShards) < c.policy.ReplicationNr {
-		// missing some replication, try to send sequentially to remaining store
-		for len(okShards) < c.policy.ReplicationNr {
-			cl, shard, err := c.getRandomStor(usedShards)
-			if err != nil {
-				// mean we don't have anymore store available
-				if err == errNoDataShardAvailable {
-					return usedShards, fmt.Errorf("coudn't replicate data to enough 0stor server, only %d succeeded, %d required", len(okShards), c.policy.ReplicationNr)
-				}
-				return nil, err
-			}
-
-			err = cl.ObjectCreate(key, value, referenceList)
-			if err != nil {
-				log.Errorf("replication write: error writing to store %s: %v", shard, err)
-				shardErr.Add([]string{shard}, lib.ShardType0Stor, err, 0)
-				usedShards = append(usedShards, shard)
-				continue
-			}
-
-			okShards = append(okShards, shard)
-			usedShards = append(usedShards, shard)
-		}
-	}
-
-	// if still not enough, return error, we can't do anything more
-	if len(okShards) < c.policy.ReplicationNr {
-		return usedShards, fmt.Errorf("coudn't replicate data to enough 0stor server, only %d succeeded, %d required", len(okShards), c.policy.ReplicationNr)
-	}
-
-	return usedShards, nil
-}
-
-func (c *Client) replicateRead(key []byte, shards []string) (*pb.Object, error) {
-	wg := sync.WaitGroup{}
-	cVal := make(chan *pb.Object)
-	cAllDone := make(chan struct{})
-	cQuit := make(chan struct{})
-
-	// start a gorountine to all possible shard
-	// the first stor to respond send the value received to cVal
-	// As soon as something is received into cVal, I close cQuit, so all other rountine should exit
-	for _, shard := range shards {
-		wg.Add(1)
-		go func(shard string) {
-			defer wg.Done()
-
-			cl, err := c.getStor(shard)
-			if err != nil {
-				log.Warningf("replication read, error getting client for %s: %v", shard, err)
-				return
-			}
-			obj, err := cl.ObjectGet(key)
-			if err != nil {
-				log.Warningf("replication read, error reading from %s: %v", shard, err)
-				return
-			}
-
-			select {
-			case <-cQuit:
-			case cVal <- obj:
-			}
-			return
-		}(shard)
-	}
-
-	// wait for all gorountine to exit
-	go func() {
-		wg.Wait()
-		close(cAllDone)
-	}()
-
-	select {
-	case <-cAllDone:
-		// if we recevie this before the value, it means we couln't get the data back
-		// from any store
-		close(cQuit)
-		return nil, fmt.Errorf("can't find a valid replication of the object")
-	case val := <-cVal:
-		close(cQuit)
-		return val, nil
-
-	}
-}
-
-func (c *Client) distributeWrite(key, value []byte, referenceList []string) ([]string, uint64, error) {
-
-	encoder, err := distribution.NewEncoder(c.policy.DistributionNr, c.policy.DistributionRedundancy)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	parts, err := encoder.Encode(value)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	type Job struct {
-		client stor.Client
-		part   []byte
-		shard  string
-	}
-
-	var (
-		cJob       = make(chan *Job)
-		usedShards = make([]string, 0, len(parts))
-		size       = uint64(0)
-		shardErr   = &lib.ShardError{}
-		wg         sync.WaitGroup
-	)
-
-	wg.Add(1)
-	go func(cJob <-chan *Job) {
-		defer wg.Done()
-		// gorountine receive work from channel
-		// each work object receive start a new goroutine that write the part to the store
-		for job := range cJob {
-			wg.Add(1)
-
-			go func(job *Job) {
-				defer wg.Done()
-				err := job.client.ObjectCreate(key, job.part, referenceList)
-				if err != nil {
-					log.Errorf("error writing to stor: %v", err)
-					shardErr.Add([]string{job.shard}, lib.ShardType0Stor, err, 0)
-				}
-			}(job)
-		}
-	}(cJob)
-
-	for i, part := range parts {
-		cl, shard, err := c.getRandomStor(usedShards)
-		if err != nil {
-			if err == errNoDataShardAvailable {
-				return nil, 0, shardErr
-			}
-			shardErr.Add([]string{shard}, lib.ShardType0Stor, err, 0)
-			continue
-		}
-
-		cJob <- &Job{
-			client: cl,
-			shard:  shard,
-			part:   part,
-		}
-
-		usedShards = append(usedShards, shard)
-		if i < c.policy.DistributionNr {
-			size += uint64(len(part))
-		}
-	}
-	// close job channel, this will allow job consuming routine to exit
-	close(cJob)
-
-	wg.Wait()
-
-	if !shardErr.Nil() {
-		log.Errorf("error distributin write: %v", shardErr)
-		return usedShards, size, shardErr
-	}
-
-	return usedShards, size, nil
-}
-
-func (c *Client) distributeRead(key []byte, originalSize int, shards []string) (*pb.Object, error) {
-
-	dec, err := distribution.NewDecoder(c.policy.DistributionNr, c.policy.DistributionRedundancy)
-	if err != nil {
-		return nil, err
-	}
-
-	var (
-		wg           = sync.WaitGroup{}
-		shardErr     = &lib.ShardError{}
-		parts        = make([][]byte, len(shards))
-		refListSlice = make([][]string, len(shards))
-	)
-
-	wg.Add(len(shards))
-	for i, shard := range shards {
-		go func(i int, shard string) {
-			defer wg.Done()
-
-			cl, err := c.getStor(shard)
-			if err != nil {
-				shardErr.Add([]string{shard}, lib.ShardType0Stor, err, 0)
-				return
-			}
-
-			obj, err := cl.ObjectGet(key)
-			if err != nil {
-				log.Errorf("error read %s from stor(%s): %v", fmt.Sprintf("%x", key), shard, err)
-				shardErr.Add([]string{shard}, lib.ShardType0Stor, err, 0)
-				return
-			}
-			parts[i] = obj.Value
-			refListSlice[i] = obj.ReferenceList
-		}(i, shard)
-	}
-
-	wg.Wait()
-
-	if !shardErr.Nil() {
-		return nil, shardErr
-	}
-
-	decoded, err := dec.Decode(parts, originalSize)
-	if err != nil {
-		return nil, err
-	}
-
-	// get non empty refList
-	// empty refList could be caused by shard error
-	var refList []string
-	for _, rl := range refListSlice {
-		if len(rl) > 0 {
-			refList = rl
-			break
-		}
-	}
-
-	return &pb.Object{
-		Key:           key,
-		Value:         decoded,
-		ReferenceList: refList,
-	}, nil
-}
-
-func (c *Client) writeRandom(key, value []byte, referenceList []string) (string, error) {
-	triedShards := []string{}
-
-	for {
-		cl, shard, err := c.getRandomStor(triedShards)
-		if err != nil {
-			return "", err
-		}
-
-		triedShards = append(triedShards, shard)
-
-		err = cl.ObjectCreate(key, value, referenceList)
-		if err == nil {
-			return shard, nil
-		}
-		log.Error(err)
-	}
-}
-
-func (c *Client) read(key []byte, shard string) (*pb.Object, error) {
-	cl, err := c.getStor(shard)
-	if err != nil {
-		return nil, err
-	}
-
-	obj, err := cl.ObjectGet(key)
-	if err != nil {
-		return nil, err
-	}
-	return obj, nil
-}
-
-func (c *Client) linkMeta(curMd, prevMd *meta.Meta, curKey, prevKey []byte) error {
-	if len(prevKey) == 0 {
-		return c.metaCli.Put(string(curKey), curMd)
-	}
-
-	// point next key of previous meta to new meta
-	prevMd.Next = curKey
-
-	// point prev key of new meta to previous one
-	curMd.Previous = prevKey
-
-	// update prev meta
-	if err := c.metaCli.Put(string(prevKey), prevMd); err != nil {
-		return err
-	}
-
-	// update new meta
-	return c.metaCli.Put(string(curKey), curMd)
-}
-
-func (c *Client) getRandomStor(except []string) (stor.Client, string, error) {
-	isIn := func(target string, list []string) bool {
-		for _, x := range list {
-			if target == x {
-				return true
-			}
-		}
-		return false
-	}
-
-	possibleShards := []string{}
-	for _, shard := range c.policy.DataShards {
-		if !isIn(shard, except) {
-			possibleShards = append(possibleShards, shard)
-		}
-	}
-
-	var shard string
-	if len(possibleShards) <= 0 {
-		return nil, "", errNoDataShardAvailable
-	} else if len(possibleShards) == 1 {
-		shard = possibleShards[0]
-	} else {
-		shard = possibleShards[rand.Intn(len(possibleShards)-1)]
-	}
-
-	// TODO: find a way to invalidate some client if an error occurs with it
-
-	cl, err := c.getStor(shard)
-	return cl, shard, err
-}
-
-func (c *Client) getStor(shard string) (stor.Client, error) {
-	c.muStorClients.Lock()
-	defer c.muStorClients.Unlock()
-
-	// first check if we don't already have a client to this shard loaded
-	cl, ok := c.storClients[shard]
-	if ok {
-		return cl, nil
-	}
-
-	// if not create the client and put in cache
-	namespace := fmt.Sprintf("%s_0stor_%s", c.policy.Organization, c.policy.Namespace)
-	cl, err := stor.NewClient(shard, namespace, c.iyoToken)
-	if err != nil {
-		return nil, err
-	}
-	c.storClients[shard] = cl
-
-	return cl, nil
-}
-
-func (c *Client) CreateJWT(namespace string, perm itsyouonline.Permission) (string, error) {
-	return c.iyoCl.CreateJWT(namespace, perm)
-}
-func (c *Client) CreateNamespace(namespace string) error {
-	return c.iyoCl.CreateNamespace(namespace)
-}
-func (c *Client) DeleteNamespace(namespace string) error {
-	return c.iyoCl.DeleteNamespace(namespace)
-}
-func (c *Client) GivePermission(namespace, userID string, perm itsyouonline.Permission) error {
-	return c.iyoCl.GivePermission(namespace, userID, perm)
-}
-func (c *Client) RemovePermission(namespace, userID string, perm itsyouonline.Permission) error {
-	return c.iyoCl.RemovePermission(namespace, userID, perm)
-}
-func (c *Client) GetPermission(namespace, userID string) (itsyouonline.Permission, error) {
-	return c.iyoCl.GetPermission(namespace, userID)
+	return str
 }

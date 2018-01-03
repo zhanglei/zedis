@@ -1,0 +1,83 @@
+/*
+ * Copyright (C) 2017-2018 GIG Technology NV and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Use `go generate ./client/metastor/encoding/proto`
+// to generate the corresponding `.pb.go` file.
+syntax = "proto3";
+
+package proto;
+
+import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+
+option (gogoproto.compare_all) = true;
+option (gogoproto.goproto_getters_all) = false;
+option (gogoproto.gostring_all) = true;
+option (gogoproto.populate_all) = true;
+option (gogoproto.testgen_all) = true;
+
+message Metadata {
+    // key defines the key of the data,
+    // and is chosen by the owner of this data.
+    bytes key = 1;
+
+    // size in bytes represents the total size of all chunks,
+    // that make up the stored data, combined.
+    int64 size = 2 [(gogoproto.customname) = "SizeInBytes"];
+
+    // creationEpoch defines the time this data was initially created,
+    // in the Unix epoch format, in nano seconds.
+    int64 creationEpoch = 3;
+    // lastWriteEpoch defines the time this data
+    // was last modified (e.g. repaired),
+    // in the Unix epoch format, in nano seconds.
+    int64 lastWriteEpoch = 4;
+
+    // chunks is the metadata list of all chunks
+    // that make up the data, when combined.
+    repeated Chunk chunks = 5 [(gogoproto.nullable) = false];
+
+    // previousKey is an optional key to the previous Metadata (node),
+    // in case this Metadata (node) is used as part
+    // of a reversed/double linked list.
+    bytes previousKey = 6;
+
+    // nextKey is an optional key to the next Metadata (node),
+    // in case this Metadata (node) is used as part
+    // of a (double) linked list.
+    bytes nextKey = 7;
+}
+
+message Chunk {
+    // size of the chunk in bytes
+    int64 size = 1 [(gogoproto.customname) = "SizeInBytes"];
+
+    // objects defines the metadata of the objects
+    // that make up this chunk.
+    repeated Object objects = 2 [(gogoproto.nullable) = false];
+
+    // hash contains the checksum/signature of the chunk (data),
+    // meaning the data of all objects (of this chunk) combined.
+    bytes hash = 3;
+}
+
+message Object {
+    // key of the Object
+    bytes key = 1;
+
+    // shardID defines the ID of the shard the object is stored on
+    string shardID = 2;
+
+}

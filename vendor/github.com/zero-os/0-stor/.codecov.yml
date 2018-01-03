@@ -1,0 +1,26 @@
+coverage:
+  status:
+    patch: off
+    project:
+      default: false
+      server:
+        paths: "server/**"
+        target: 80%
+        threshold: 5%
+      client:
+        paths: "client/**"
+        target: 75%
+        threshold: 5%
+      other:
+        paths: "cmd/**"
+        target: 65%
+        threshold: 5%
+  range: 50..75
+  round: down
+  precision: 0
+  ignore:
+    # ignore all generated files, as we do not control those
+    - server/api/grpc/schema/zstor.pb.go
+    - server/api/grp/generate.go
+    - client/metastor/encoding/proto/generate.go
+    - client/metastor/encoding/proto/metadata.pb.go

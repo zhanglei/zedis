@@ -3,41 +3,47 @@ GOOS ?= linux
 GOARCH ?= amd64
 
 TIMEOUT ?= 10m
+RACE_TIMEOUT ?= 20m
 
 PACKAGE = github.com/zero-os/0-stor
 COMMIT_HASH = $(shell git rev-parse --short HEAD 2>/dev/null)
 BUILD_DATE = $(shell date +%FT%T%z)
 
-SERVER_PACKAGES = $(shell go list ./server/... | grep -v vendor)
-CLIENT_PACKAGES = $(shell go list ./client/... | grep -v vendor)
+SERVER_PACKAGES = $(shell go list ./server/...)
+CLIENT_PACKAGES = $(shell go list ./client/...)
+CMD_PACKAGES = $(shell go list ./cmd/...)
 
-ldflags = -extldflags "-static" -s -w -X main.CommitHash=$(COMMIT_HASH) -X main.BuildDate=$(BUILD_DATE)
+ldflags = -extldflags "-static"
+ldflagsversion = -X $(PACKAGE)/cmd.CommitHash=$(COMMIT_HASH) -X $(PACKAGE)/cmd.BuildDate=$(BUILD_DATE) -s -w
 
-all: server cli
+all: client server
 
-cli: $(OUTPUT)
+client: $(OUTPUT)
 ifeq ($(GOOS), darwin)
 	GOOS=$(GOOS) GOARCH=$(GOARCH) \
-		go build -o $(OUTPUT)/zerostorcli ./client/cmd/zerostorcli
+		go build -ldflags '$(ldflagsversion)' -o $(OUTPUT)/zstor ./cmd/zstor
 else
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
-		go build -ldflags '$(ldflags)' -o $(OUTPUT)/zerostorcli ./cmd/zerostorcli
+		go build -ldflags '$(ldflags)$(ldflagsversion)' -o $(OUTPUT)/zstor ./cmd/zstor
 endif
 
 server: $(OUTPUT)
 ifeq ($(GOOS), darwin)
 	GOOS=$(GOOS) GOARCH=$(GOARCH) \
-		go build -o $(OUTPUT)/zerostorserver ./server
+		go build -ldflags '$(ldflagsversion)' -o $(OUTPUT)/zstordb ./cmd/zstordb
 else
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
-		go build -ldflags '$(ldflags)' -o $(OUTPUT)/zerostorserver ./cmd/zerostorserver
+		go build -ldflags '$(ldflags)$(ldflagsversion)' -o $(OUTPUT)/zstordb ./cmd/zstordb
 endif
 
 install: all
-	cp $(OUTPUT)/zerostorcli $(GOPATH)/bin/zerostorcli
-	cp $(OUTPUT)/zerostorserver $(GOPATH)/bin/zerostorserver
+	cp $(OUTPUT)/zstor $(GOPATH)/bin/zstor
+	cp $(OUTPUT)/zstordb $(GOPATH)/bin/zstordb
 
-test: testserver testclient
+test: testserver testclient testcmd
+
+testcov:
+	utils/scripts/coverage_test.sh
 
 testrace: testserverrace testclientrace
 
@@ -45,15 +51,43 @@ testserver:
 	go test -v -timeout $(TIMEOUT) $(SERVER_PACKAGES)
 
 testclient:
-	go test  -v -timeout $(TIMEOUT) $(CLIENT_PACKAGES)
+	go test -v -timeout $(TIMEOUT) $(CLIENT_PACKAGES)
+
+testcmd:
+	go test -v -timeout $(TIMEOUT) $(CMD_PACKAGES)
 
 testserverrace:
-	go test  -v -race -timeout $(TIMEOUT) $(SERVER_PACKAGES)
+	go test -race -timeout $(RACE_TIMEOUT) $(SERVER_PACKAGES)
 
 testclientrace:
-	go test  -v -race -timeout $(TIMEOUT) $(CLIENT_PACKAGES)
+	go test -race -timeout $(RACE_TIMEOUT) $(CLIENT_PACKAGES)
+
+testcodegen:
+	./utils/scripts/test_codegeneration.sh
+
+ensure_deps:
+	dep ensure -v
+	make prune_deps
+
+add_dep:
+	dep ensure -v
+	dep ensure -v -add $$DEP
+	make prune_deps
+
+update_dep:
+	dep ensure -v
+	dep ensure -v -update $$DEP
+	make prune_deps
+
+update_deps:
+	dep ensure -v
+	dep ensure -update -v
+	make prune_deps
+
+prune_deps:
+	./utils/scripts/prune_deps_safe.sh
 
 $(OUTPUT):
 	mkdir -p $(OUTPUT)
 
-.PHONY: $(OUTPUT) zerostorcli 0storserver test testserver testclient testserverrace testclientrace
+.PHONY: $(OUTPUT) client server install test testcov testrace testserver testclient testcmd testserverrace testclientrace testcodegen ensure_deps add_dep update_dep update_deps prune_deps
