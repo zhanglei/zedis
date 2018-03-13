@@ -82,7 +82,7 @@
   branch = "master"
   name = "github.com/tidwall/redcon"
   packages = ["."]
-  revision = "f2794a0a30ffba81a2b2e26e9493185b72811120"
+  revision = "56b016127ae730019c5e3073a413ad9526440c38"
 
 [[projects]]
   branch = "master"

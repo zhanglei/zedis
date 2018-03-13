@@ -37,9 +37,8 @@ func auth(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	connsJWTLock.Lock()
-	connsJWT[conn] = jwtStr
-	connsJWTLock.Unlock()
+	ctx := context{JWT: jwtStr}
+	conn.SetContext(ctx)
 
 	conn.WriteString("OK")
 }
@@ -54,14 +53,13 @@ func set(conn redcon.Conn, cmd redcon.Command) {
 	// check if command needs authentication
 	_, authorize := zConfig.AuthCommands[string(cmd.Args[0])]
 	if authorize {
-		connsJWTLock.Lock()
-		jwtStr, ok := connsJWT[conn]
-		connsJWTLock.Unlock()
-		if !ok {
+		ctx, err := getContext(conn)
+		if err != nil {
 			conn.WriteError(unAuthMsg)
 			return
 		}
-		err := permissionValidator(jwtStr, zConfig.JWTOrganization, zConfig.JWTNamespace, jwt.WriteScopes)
+		jwtStr := ctx.JWT
+		err = permissionValidator(jwtStr, zConfig.JWTOrganization, zConfig.JWTNamespace, jwt.WriteScopes)
 		if err != nil {
 			conn.WriteError("ERR JWT invalid: " + err.Error())
 			return
@@ -82,14 +80,13 @@ func get(conn redcon.Conn, cmd redcon.Command) {
 	// check if command needs authentication
 	_, authorize := zConfig.AuthCommands[string(cmd.Args[0])]
 	if authorize {
-		connsJWTLock.Lock()
-		jwtStr, ok := connsJWT[conn]
-		connsJWTLock.Unlock()
-		if !ok {
+		ctx, err := getContext(conn)
+		if err != nil {
 			conn.WriteError(unAuthMsg)
 			return
 		}
-		err := permissionValidator(jwtStr, zConfig.JWTOrganization, zConfig.JWTNamespace, jwt.ReadScopes)
+		jwtStr := ctx.JWT
+		err = permissionValidator(jwtStr, zConfig.JWTOrganization, zConfig.JWTNamespace, jwt.ReadScopes)
 		if err != nil {
 			conn.WriteError("ERR JWT invalid: " + err.Error())
 			return
@@ -116,14 +113,13 @@ func exists(conn redcon.Conn, cmd redcon.Command) {
 	// check if command needs authentication
 	_, authorize := zConfig.AuthCommands[string(cmd.Args[0])]
 	if authorize {
-		connsJWTLock.Lock()
-		jwtStr, ok := connsJWT[conn]
-		connsJWTLock.Unlock()
-		if !ok {
+		ctx, err := getContext(conn)
+		if err != nil {
 			conn.WriteError(unAuthMsg)
 			return
 		}
-		err := permissionValidator(jwtStr, zConfig.JWTOrganization, zConfig.JWTNamespace, jwt.ReadScopes)
+		jwtStr := ctx.JWT
+		err = permissionValidator(jwtStr, zConfig.JWTOrganization, zConfig.JWTNamespace, jwt.ReadScopes)
 		if err != nil {
 			conn.WriteError("ERR JWT invalid: " + err.Error())
 			return

@@ -101,6 +101,16 @@ func NewServer(addr string,
 	return NewServerNetwork("tcp", addr, handler, accept, closed)
 }
 
+// NewServerTLS returns a new Redcon TLS server configured on "tcp" network net.
+func NewServerTLS(addr string,
+	handler func(conn Conn, cmd Command),
+	accept func(conn Conn) bool,
+	closed func(conn Conn, err error),
+	config *tls.Config,
+) *TLSServer {
+	return NewServerNetworkTLS("tcp", addr, handler, accept, closed, config)
+}
+
 // NewServerNetwork returns a new Redcon server. The network net must be
 // a stream-oriented network: "tcp", "tcp4", "tcp6", "unix" or "unixpacket"
 func NewServerNetwork(
@@ -166,6 +176,11 @@ func (s *Server) Close() error {
 // ListenAndServe serves incoming connections.
 func (s *Server) ListenAndServe() error {
 	return s.ListenServeAndSignal(nil)
+}
+
+// Addr returns server's listen address
+func (s *Server) Addr() net.Addr {
+	return s.ln.Addr()
 }
 
 // Close stops listening on the TCP address.
@@ -237,10 +252,11 @@ func (s *Server) ListenServeAndSignal(signal chan error) error {
 		}
 		return err
 	}
+	s.ln = ln
 	if signal != nil {
 		signal <- nil
 	}
-	return serve(s, ln)
+	return serve(s)
 }
 
 // ListenServeAndSignal serves incoming connections and passes nil or error
@@ -253,18 +269,16 @@ func (s *TLSServer) ListenServeAndSignal(signal chan error) error {
 		}
 		return err
 	}
+	s.ln = ln
 	if signal != nil {
 		signal <- nil
 	}
-	return serve(s.Server, ln)
+	return serve(s.Server)
 }
 
-func serve(s *Server, ln net.Listener) error {
-	s.mu.Lock()
-	s.ln = ln
-	s.mu.Unlock()
+func serve(s *Server) error {
 	defer func() {
-		ln.Close()
+		s.ln.Close()
 		func() {
 			s.mu.Lock()
 			defer s.mu.Unlock()
@@ -275,7 +289,7 @@ func serve(s *Server, ln net.Listener) error {
 		}()
 	}()
 	for {
-		lnconn, err := ln.Accept()
+		lnconn, err := s.ln.Accept()
 		if err != nil {
 			s.mu.Lock()
 			done := s.done

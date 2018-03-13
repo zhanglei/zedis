@@ -2,7 +2,6 @@ package server
 
 import (
 	"strings"
-	"sync"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/tidwall/redcon"
@@ -13,10 +12,6 @@ import (
 var (
 	zConfig    *config.Zedis
 	storClient stor.Client
-
-	// saves the jwt for a connection
-	connsJWT     map[redcon.Conn]string
-	connsJWTLock *sync.Mutex
 )
 
 // ListenAndServeRedis runs the redis server
@@ -28,9 +23,6 @@ func ListenAndServeRedis(cfg *config.Zedis) error {
 		return err
 	}
 
-	connsJWT = make(map[redcon.Conn]string)
-	connsJWTLock = &sync.Mutex{}
-
 	var errChannel chan error
 
 	// serve Redis over plain TCP
@@ -39,7 +31,7 @@ func ListenAndServeRedis(cfg *config.Zedis) error {
 			log.Infof("Redis plain TCP interface listening at localhost%s", zConfig.Port)
 			defer log.Info("Redis plain TCP interface closed")
 
-			errChannel <- redcon.ListenAndServe(zConfig.Port, handler, accept, closed)
+			errChannel <- redcon.ListenAndServe(zConfig.Port, handler, accept, nil)
 		}()
 	}
 
@@ -54,7 +46,7 @@ func ListenAndServeRedis(cfg *config.Zedis) error {
 		log.Infof("Redis TLS interface listening at localhost%s", zConfig.TLSPort)
 		defer log.Info("Redis TLS interface closed")
 
-		errChannel <- redcon.ListenAndServeTLS(zConfig.TLSPort, handler, accept, closed, tlsCfg)
+		errChannel <- redcon.ListenAndServeTLS(zConfig.TLSPort, handler, accept, nil, tlsCfg)
 	}()
 
 	// return if context is done or error
@@ -89,11 +81,4 @@ func handler(conn redcon.Conn, cmd redcon.Command) {
 func accept(conn redcon.Conn) bool {
 	log.Debugf("Received connection from %s", conn.RemoteAddr())
 	return true
-}
-
-// redcon closed func
-func closed(conn redcon.Conn, err error) {
-	connsJWTLock.Lock()
-	defer connsJWTLock.Unlock()
-	delete(connsJWT, conn)
 }

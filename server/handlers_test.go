@@ -1,11 +1,9 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"net"
 	"strconv"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,8 +13,6 @@ import (
 )
 
 func init() {
-	connsJWT = make(map[redcon.Conn]string)
-	connsJWTLock = &sync.Mutex{}
 	zConfig = new(config.Zedis)
 	zConfig.AuthCommands = make(map[string]struct{})
 
@@ -95,7 +91,7 @@ func TestSet(t *testing.T) {
 	assert.Equal(t, unAuthMsg, conn.s)
 
 	// valid args and jwt present
-	connsJWT[conn] = "aJWT"
+	conn.SetContext(context{JWT: "aJWT"})
 
 	set(conn, cmd)
 	assert.Equal(t, "OK", conn.s)
@@ -135,7 +131,7 @@ func TestGet(t *testing.T) {
 	assert.Equal(t, unAuthMsg, conn.s)
 
 	// valid args, valid JWT
-	connsJWT[conn] = "aJWT"
+	conn.SetContext(context{JWT: "aJWT"})
 	get(conn, cmd)
 	assert.Equal(t, "world", conn.s)
 
@@ -176,7 +172,7 @@ func TestExists(t *testing.T) {
 	assert.Equal(t, unAuthMsg, conn.s)
 
 	// invalid jwt
-	connsJWT[conn] = "aJWT"
+	conn.SetContext(context{JWT: "aJWT"})
 	permissionValidator = stubAuthValidatorErr
 
 	exists(conn, cmd)
@@ -242,7 +238,7 @@ func TestUnknown(t *testing.T) {
 // stubs redcon.Conn
 type stubConn struct {
 	s      string
-	ctx    context.Context
+	ctx    interface{}
 	cmds   []redcon.Command
 	conn   net.Conn
 	closed bool
@@ -253,7 +249,7 @@ func (c *stubConn) Close() error {
 	return nil
 }
 func (c *stubConn) Context() interface{}        { return c.ctx }
-func (c *stubConn) SetContext(v interface{})    { c.ctx = v.(context.Context) }
+func (c *stubConn) SetContext(v interface{})    { c.ctx = v }
 func (c *stubConn) SetReadBuffer(n int)         {}
 func (c *stubConn) WriteString(str string)      { c.s = str }
 func (c *stubConn) WriteBulk(bulk []byte)       { c.s = string(bulk) }
